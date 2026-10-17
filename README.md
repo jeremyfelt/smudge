@@ -4,7 +4,7 @@ A small creature that lives on your iPhone's Home Screen and eats the colors you
 
 ## Install it on an iPhone
 
-1. Open https://jeremyfelt.github.io/smudge/ in Safari.
+1. Open https://smudge.jeremyfelt.com/ in Safari.
 2. Tap **Share** (in iOS 26 it's inside the **•••** menu), then **Add to Home Screen**.
 3. Open Smudge from your Home Screen.
 
