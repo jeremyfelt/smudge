@@ -837,8 +837,9 @@ const Sound = (() => {
   }
   function unlock() {
     armed = true;
+    Mic.wake();
     if (!S.s.sound) return;
-    if (!Mic.on && !Lullaby.playing) setSession('ambient');
+    if (!Mic.busy && !Lullaby.playing) setSession('ambient');
     const g = live(); if (!g) return;
     try { const b = g.ctx.createBuffer(1, 1, 22050); const s = g.ctx.createBufferSource(); s.buffer = b; s.connect(g.ctx.destination); s.start(0); } catch (e) {}
   }
@@ -930,6 +931,7 @@ const Sound = (() => {
       sched.push([t + off, t + dur + off]);
       t += dur + rand(0.025, 0.05) * slow;
     }
+    if (g) hush(t - t0 + 0.3);
     return sched;
   }
 
@@ -962,7 +964,11 @@ const Sound = (() => {
     shutter(g, t) { hiss(g, { t, d: 0.05, peak: 0.12, type: 'highpass', f0: 2500 }); },
     snore(g, t) { hiss(g, { t, d: 1.2, peak: 0.2, type: 'bandpass', f0: 380, f1: 520, q: 1 }); hiss(g, { t: t + 1.5, d: 1.4, peak: 0.14, type: 'lowpass', f0: 420, f1: 300 }); },
   };
-  function play(name, ...args) { const g = live(); if (!g || !SFX[name]) return; try { SFX[name](g, g.ctx.currentTime + 0.01, ...args); } catch (e) {} }
+  // when Smudge's own sounds will have finished (the raw microphone hears the speaker)
+  let quietAt = 0;
+  const hush = (sec) => { quietAt = Math.max(quietAt, performance.now() + sec * 1000); };
+  const LONG = { yawn: 1.5, raspberry: 1, fanfare: 1.6, chime: 1.2, snore: 3, boing: 0.5, dizzy: 0.6 };
+  function play(name, ...args) { const g = live(); if (!g || !SFX[name]) return; hush((LONG[name] || 0.35) + 0.15); try { SFX[name](g, g.ctx.currentTime + 0.01, ...args); } catch (e) {} }
   function ping(k) { const g = live(); if (!g) return; tone(g, { f0: 880 + k * 1000, t: g.ctx.currentTime + 0.01, d: 0.06, peak: 0.04 + 0.06 * k, send: 0.35 }); }
 
   /* ---------- continuous voices: purring, inflating ---------- */
@@ -1013,13 +1019,14 @@ const Sound = (() => {
     e.gain.setTargetAtTime(0.0001, t, 0.05);
     o.start(t0); s.start(t0); o.stop(t + 0.4); s.stop(t + 0.4);
     vib(g, o, 5.5, 6, t0, t - t0 + 0.2);
+    hush(t - t0 + 0.5);
     return t - t0;
   }
 
   function setPitchFrom(c) { voicePitch = c ? lerp(0.86, 1.14, clamp((c.lab[0] - 0.35) / 0.55, 0, 1)) : 1; }
   function toggle(on) { S.s.sound = on; Store.save(); if (!on) { Object.values(loops).forEach((l) => l.stop()); if (G) G.ctx.suspend().catch(() => {}); } else unlock(); }
 
-  return { unlock, play, speak, ping, loop, echo, setSession, setPitchFrom, toggle, build, tone, bell, hiss, env, syll, SFX, get ctx() { return G && G.ctx; }, get graph() { return live(); } };
+  return { unlock, play, speak, ping, loop, echo, setSession, setPitchFrom, toggle, build, tone, bell, hiss, env, syll, SFX, get ctx() { return G && G.ctx; }, get graph() { return live(); }, get busy() { return performance.now() < quietAt || !!loops.purr; } };
 })();
 
 /* ============================================================
@@ -1976,36 +1983,59 @@ const Motion = (() => {
 
 /* ---------- Hearing: blowing, humming, and echoing tunes back ---------- */
 const Mic = (() => {
-  let on = false, stream = null, ac = null, an = null, td = null, fd = null, dec = null, sq = null;
-  let floor = 0.01, frameN = 0, deafUntil = 0;
-  const st = { level: 0, blow: 0, singing: false, midi: 0, clarity: 0 };
+  let on = false, starting = false, stream = null, ac = null, an = null, td = null, fd = null, dec = null, sq = null;
+  let floor = 0.01, frameN = 0, deafUntil = 0, asked = false;
+  const st = { level: 0, blow: 0, singing: false, midi: 0, clarity: 0, needsTap: false };
   let take = [], quiet = 0;
-  let onEcho = null;
+  let onEcho = null, onLost = null;
 
+  function makeContext() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try { const c = new AC(); c.resume().catch(() => {}); return c; } catch (e) { return null; }
+  }
   async function start() {
     if (ENV.framed || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return 'unavailable';
+    starting = true;
+    // iOS ends a microphone track unless the page's audio session allows recording,
+    // and only lets an audio engine run if it starts inside the tap. Do both before asking.
+    Sound.setSession('play-and-record');
+    ac = makeContext();
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
-    } catch (e) { return e && (e.name === 'NotAllowedError' || e.name === 'SecurityError') ? 'denied' : 'unavailable'; }
+      // raw input: iOS voice processing would scrub out blowing as "noise"
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    } catch (e) {
+      starting = false; stop();
+      return e && (e.name === 'NotAllowedError' || e.name === 'SecurityError') ? 'denied' : 'unavailable';
+    }
     try {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      ac = new AC();
-      if (ac.state !== 'running') await ac.resume().catch(() => {});
+      if (!ac) ac = makeContext();
       const src = ac.createMediaStreamSource(stream);
       an = ac.createAnalyser(); an.fftSize = 2048; an.smoothingTimeConstant = 0.2;
       src.connect(an);
+      // a silent path to the speakers keeps every engine pulling audio through the analyser
+      const mute = ac.createGain(); mute.gain.value = 0; an.connect(mute); mute.connect(ac.destination);
       td = new Float32Array(an.fftSize); fd = new Float32Array(an.frequencyBinCount);
       dec = new Float32Array(an.fftSize >> 1); sq = new Float32Array((an.fftSize >> 1) + 1);
-    } catch (e) { stop(); return 'unavailable'; }
-    on = true; take = []; quiet = 0; floor = 0.01;
+      const track = stream.getAudioTracks()[0];
+      if (track) track.addEventListener('ended', () => { if (on) { stop(); onLost && onLost(); } });
+      if (ac.state !== 'running') await ac.resume().catch(() => {});
+    } catch (e) { starting = false; stop(); return 'unavailable'; }
+    on = true; starting = false; take = []; quiet = 0; floor = 0.01; asked = false;
+    st.needsTap = ac.state !== 'running';
     return 'granted';
   }
+  // called from every tap: a paused listening engine can only restart inside one
+  function wake() {
+    if (!on || !ac || ac.state === 'running') return;
+    ac.resume().then(() => { st.needsTap = ac.state !== 'running'; }).catch(() => {});
+  }
   function stop() {
-    on = false;
+    on = false; starting = false;
     try { stream && stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
     try { ac && ac.close(); } catch (e) {}
     stream = null; ac = null; an = null;
-    st.level = st.blow = 0; st.singing = false;
+    st.level = st.blow = 0; st.singing = false; st.needsTap = false;
     if (!Lullaby.playing) Sound.setSession('ambient');
   }
   function pitch(sr) {
@@ -2040,7 +2070,7 @@ const Mic = (() => {
     rms = Math.sqrt(rms / td.length);
     floor = rms < floor ? lerp(floor, rms, 0.25) : lerp(floor, rms, 0.0015);
     floor = Math.max(floor, 0.0015);
-    const deaf = performance.now() < deafUntil;
+    const deaf = performance.now() < deafUntil || Sound.busy;
     st.level = deaf ? 0 : clamp((rms - floor * 1.5) / 0.15, 0, 1);
     // spectrum: is it breathy noise (blowing) or a tone (humming)?
     an.getFloatFrequencyData(fd);
@@ -2050,12 +2080,12 @@ const Mic = (() => {
     const flatness = Math.exp(sl / n) / (sn / n);
     const lowShare = low / sn;
     frameN++;
-    if (frameN % 2 === 0 && !deaf && rms > Math.max(0.006, floor * 2.5)) { const p = pitch(ac.sampleRate); st.clarity = p.c; st.midi = p.f ? 69 + 12 * Math.log2(p.f / 440) : 0; }
-    else if (rms <= Math.max(0.006, floor * 2.5)) st.clarity = 0;
+    if (frameN % 2 === 0 && !deaf && rms > Math.max(0.004, floor * 2.5)) { const p = pitch(ac.sampleRate); st.clarity = p.c; st.midi = p.f ? 69 + 12 * Math.log2(p.f / 440) : 0; }
+    else if (rms <= Math.max(0.004, floor * 2.5)) st.clarity = 0;
     // blowing is loud, breathy and has no steady pitch; humming has a clear one
     const blowing = !deaf && rms > Math.max(0.05, floor * 7) && st.clarity < 0.7 && (flatness > 0.12 || lowShare > 0.6);
     st.blow = clamp(st.blow + (blowing ? dt * 5 : -dt * 3.5), 0, 1);
-    const singing = !deaf && !blowing && st.clarity > 0.84 && st.midi > 40 && st.midi < 86 && rms > Math.max(0.01, floor * 3);
+    const singing = !deaf && !blowing && st.clarity > 0.84 && st.midi > 40 && st.midi < 86 && rms > Math.max(0.005, floor * 3);
     const now = performance.now() / 1000;
     if (singing) { quiet = 0; if (!take.length || now - take[take.length - 1].t >= 0.045) take.push({ m: st.midi, a: rms, t: now }); }
     else if (take.length) {
@@ -2086,7 +2116,7 @@ const Mic = (() => {
     onEcho && onEcho(notes);
   }
   function deafen(sec) { deafUntil = performance.now() + sec * 1000; take = []; }
-  return { start, stop, frame, deafen, st, set onEcho(fn) { onEcho = fn; }, get on() { return on; }, available: () => !ENV.framed && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) };
+  return { start, stop, wake, frame, deafen, st, set onEcho(fn) { onEcho = fn; }, set onLost(fn) { onLost = fn; }, get on() { return on; }, get busy() { return on || starting; }, available: () => !ENV.framed && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) };
 })();
 
 /* ---------- Keep the screen awake (nightlight, camera hunts) ---------- */
@@ -2828,10 +2858,10 @@ const App = (() => {
   let lastTouch = nowS(), nextLook = 0, nextHop = nowS() + 12, nextMuse = nowS() + 45, nextYawn = nowS() + 20, nextZ = 0, nextNote = 0, nextSave = 0, nextHud = 0, nextDay = 0;
   let pokes = [], gesture = null, expectLanding = false;
   let dizzyUntil = 0, puddleOn = false, flatSince = 0, faceDownSince = 0;
-  let inflate = 0, inflateState = 'idle', thrust = 0, floatSaid = false;
+  let inflate = 0, inflateState = 'idle', thrust = 0, floatSaid = false, nextPerk = 0;
   let lastSample = 0, lastPing = 0, lastName = '', lastNameAt = 0, ringMoved = true;
   let today = dayKey();
-  let installEvt = null, askYes = null, lastAte = 0, introUntil = 0, frameOdd = false;
+  let installEvt = null, askYes = null, lastAte = 0, introUntil = 0, frameOdd = false, updateReady = false, shownAt = performance.now();
   const HALF = 36 * 3600e3;
 
   /* ---------- canvas + layout ---------- */
@@ -3199,9 +3229,13 @@ const App = (() => {
     if (!Mic.available()) { UI.pressed('listen', false); UI.toast(ENV.framed ? 'Listening works once Smudge is on your Home Screen' : 'This browser can’t share the microphone'); return; }
     if (mode === 'sleep') wakeUp(true);
     const r = await Mic.start();
-    if (r === 'granted') { UI.pressed('listen', true); Pet.setFace('wide', 'o', 1); UI.say(pick(['i’m listening! hum me a tune', 'ears on. hum, or blow on me!'])); }
-    else { UI.pressed('listen', false); UI.toast(r === 'denied' ? 'Microphone access is off. You can allow it in Settings.' : 'The microphone isn’t available right now'); }
+    if (r === 'granted') {
+      UI.pressed('listen', true); Pet.setFace('wide', 'o', 1);
+      UI.say(Mic.st.needsTap ? 'tap me once so i can hear you' : pick(['i’m listening! hum me a tune', 'ears on. hum, or blow on me!']));
+    }
+    else { UI.pressed('listen', false); UI.toast(r === 'denied' ? 'Microphone access is off for Smudge. Allow it when asked, or in Settings.' : 'The microphone isn’t available right now'); }
   }
+  Mic.onLost = () => { UI.pressed('listen', false); endInflate(); UI.toast('Listening stopped. Tap Listen to start again.'); };
   Mic.onEcho = (notes) => {
     const total = notes.reduce((a, n) => a + n.d, 0);
     Mic.deafen(total + 2);
@@ -3312,6 +3346,9 @@ const App = (() => {
         if (inflate > 0.5) { inflateState = 'release'; thrust = rand(TAU); Sound.play('raspberry'); Pet.setFace('squint', 'o', 1.2); }
         else { inflateState = 'deflating'; Pet.setFace('happy', 'smile', 0.8); }
       }
+      if (ms.level > 0.22 && !ms.singing && ms.blow < 0.2 && inflateState === 'idle' && t > nextPerk && mode === 'home') {
+        nextPerk = t + rand(2.5, 4); Pet.setFace('wide', 'o', 0.7); Pet.lookDir(0, 1); Pet.hop(90);
+      }
       if (ms.singing && inflateState === 'idle') {
         Pet.face.openT = 0.25 + ms.level * 0.6;
         Pet.setFace('closed', 'smile', 0.4);
@@ -3348,7 +3385,7 @@ const App = (() => {
         if (Math.random() < 0.3) { Sound.play('yawn'); Pet.setFace('closed', 'wide', 1.3); }
         else Pet.setFace('closed', 'tiny', rand(1.8, 3.2)); // nodding off
       }
-      if (t > nextMuse && t - lastTouch > 25 && t > introUntil && !UI.speaking() && !UI.sheetOpen) { nextMuse = t + rand(45, 90); UI.say(muse()); }
+      if (t > nextMuse && t - lastTouch > 25 && t > introUntil && !UI.speaking() && !UI.sheetOpen && !Mic.on) { nextMuse = t + rand(45, 90); UI.say(muse()); }
     }
     if (mode === 'sleep' && t > nextZ) { nextZ = t + 2.4; const h = Pet.headTop(); FX.zzz(h.x + Pet.R * 0.35, h.y); }
     if (mode !== 'camera') restoreBase();
@@ -3432,7 +3469,19 @@ const App = (() => {
   }
   function plumbing() {
     if ('serviceWorker' in navigator && !ENV.framed && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
-      navigator.serviceWorker.register('sw.js').catch(() => {});
+      const hadController = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (!hadController) return; // first install: this copy is already current
+        // a new version just took over; pick it up now if Smudge only just came on screen, otherwise on the next return
+        if (performance.now() - shownAt < 20000 && mode === 'home' && !UI.sheetOpen && !gesture) location.reload();
+        else updateReady = true;
+      });
+      navigator.serviceWorker.register('sw.js').then((reg) => {
+        // Home Screen apps mostly resume rather than reload, so ask for a newer version on every return
+        const check = () => reg.update().catch(() => {});
+        setTimeout(check, 1500);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) check(); });
+      }).catch(() => {});
     }
     if (ENV.standalone && navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
     launchScreen();
@@ -3452,7 +3501,8 @@ const App = (() => {
       if (Mic.on) { Mic.stop(); UI.pressed('listen', false); endInflate(); }
       const l = Sound.loop('purr'); l && l.stop();
     } else {
-      lastT = performance.now();
+      if (updateReady && mode !== 'sleep') { location.reload(); return; }
+      shownAt = lastT = performance.now();
       updateSky(true); checkDay(); refreshPigments();
       const away = (Date.now() - (S.lastSeen || Date.now())) / 1000;
       if (away > 3600 && mode === 'home') greet(false);

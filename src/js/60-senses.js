@@ -86,36 +86,59 @@ const Motion = (() => {
 
 /* ---------- Hearing: blowing, humming, and echoing tunes back ---------- */
 const Mic = (() => {
-  let on = false, stream = null, ac = null, an = null, td = null, fd = null, dec = null, sq = null;
-  let floor = 0.01, frameN = 0, deafUntil = 0;
-  const st = { level: 0, blow: 0, singing: false, midi: 0, clarity: 0 };
+  let on = false, starting = false, stream = null, ac = null, an = null, td = null, fd = null, dec = null, sq = null;
+  let floor = 0.01, frameN = 0, deafUntil = 0, asked = false;
+  const st = { level: 0, blow: 0, singing: false, midi: 0, clarity: 0, needsTap: false };
   let take = [], quiet = 0;
-  let onEcho = null;
+  let onEcho = null, onLost = null;
 
+  function makeContext() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try { const c = new AC(); c.resume().catch(() => {}); return c; } catch (e) { return null; }
+  }
   async function start() {
     if (ENV.framed || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return 'unavailable';
+    starting = true;
+    // iOS ends a microphone track unless the page's audio session allows recording,
+    // and only lets an audio engine run if it starts inside the tap. Do both before asking.
+    Sound.setSession('play-and-record');
+    ac = makeContext();
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
-    } catch (e) { return e && (e.name === 'NotAllowedError' || e.name === 'SecurityError') ? 'denied' : 'unavailable'; }
+      // raw input: iOS voice processing would scrub out blowing as "noise"
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    } catch (e) {
+      starting = false; stop();
+      return e && (e.name === 'NotAllowedError' || e.name === 'SecurityError') ? 'denied' : 'unavailable';
+    }
     try {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      ac = new AC();
-      if (ac.state !== 'running') await ac.resume().catch(() => {});
+      if (!ac) ac = makeContext();
       const src = ac.createMediaStreamSource(stream);
       an = ac.createAnalyser(); an.fftSize = 2048; an.smoothingTimeConstant = 0.2;
       src.connect(an);
+      // a silent path to the speakers keeps every engine pulling audio through the analyser
+      const mute = ac.createGain(); mute.gain.value = 0; an.connect(mute); mute.connect(ac.destination);
       td = new Float32Array(an.fftSize); fd = new Float32Array(an.frequencyBinCount);
       dec = new Float32Array(an.fftSize >> 1); sq = new Float32Array((an.fftSize >> 1) + 1);
-    } catch (e) { stop(); return 'unavailable'; }
-    on = true; take = []; quiet = 0; floor = 0.01;
+      const track = stream.getAudioTracks()[0];
+      if (track) track.addEventListener('ended', () => { if (on) { stop(); onLost && onLost(); } });
+      if (ac.state !== 'running') await ac.resume().catch(() => {});
+    } catch (e) { starting = false; stop(); return 'unavailable'; }
+    on = true; starting = false; take = []; quiet = 0; floor = 0.01; asked = false;
+    st.needsTap = ac.state !== 'running';
     return 'granted';
   }
+  // called from every tap: a paused listening engine can only restart inside one
+  function wake() {
+    if (!on || !ac || ac.state === 'running') return;
+    ac.resume().then(() => { st.needsTap = ac.state !== 'running'; }).catch(() => {});
+  }
   function stop() {
-    on = false;
+    on = false; starting = false;
     try { stream && stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
     try { ac && ac.close(); } catch (e) {}
     stream = null; ac = null; an = null;
-    st.level = st.blow = 0; st.singing = false;
+    st.level = st.blow = 0; st.singing = false; st.needsTap = false;
     if (!Lullaby.playing) Sound.setSession('ambient');
   }
   function pitch(sr) {
@@ -150,7 +173,7 @@ const Mic = (() => {
     rms = Math.sqrt(rms / td.length);
     floor = rms < floor ? lerp(floor, rms, 0.25) : lerp(floor, rms, 0.0015);
     floor = Math.max(floor, 0.0015);
-    const deaf = performance.now() < deafUntil;
+    const deaf = performance.now() < deafUntil || Sound.busy;
     st.level = deaf ? 0 : clamp((rms - floor * 1.5) / 0.15, 0, 1);
     // spectrum: is it breathy noise (blowing) or a tone (humming)?
     an.getFloatFrequencyData(fd);
@@ -160,12 +183,12 @@ const Mic = (() => {
     const flatness = Math.exp(sl / n) / (sn / n);
     const lowShare = low / sn;
     frameN++;
-    if (frameN % 2 === 0 && !deaf && rms > Math.max(0.006, floor * 2.5)) { const p = pitch(ac.sampleRate); st.clarity = p.c; st.midi = p.f ? 69 + 12 * Math.log2(p.f / 440) : 0; }
-    else if (rms <= Math.max(0.006, floor * 2.5)) st.clarity = 0;
+    if (frameN % 2 === 0 && !deaf && rms > Math.max(0.004, floor * 2.5)) { const p = pitch(ac.sampleRate); st.clarity = p.c; st.midi = p.f ? 69 + 12 * Math.log2(p.f / 440) : 0; }
+    else if (rms <= Math.max(0.004, floor * 2.5)) st.clarity = 0;
     // blowing is loud, breathy and has no steady pitch; humming has a clear one
     const blowing = !deaf && rms > Math.max(0.05, floor * 7) && st.clarity < 0.7 && (flatness > 0.12 || lowShare > 0.6);
     st.blow = clamp(st.blow + (blowing ? dt * 5 : -dt * 3.5), 0, 1);
-    const singing = !deaf && !blowing && st.clarity > 0.84 && st.midi > 40 && st.midi < 86 && rms > Math.max(0.01, floor * 3);
+    const singing = !deaf && !blowing && st.clarity > 0.84 && st.midi > 40 && st.midi < 86 && rms > Math.max(0.005, floor * 3);
     const now = performance.now() / 1000;
     if (singing) { quiet = 0; if (!take.length || now - take[take.length - 1].t >= 0.045) take.push({ m: st.midi, a: rms, t: now }); }
     else if (take.length) {
@@ -196,7 +219,7 @@ const Mic = (() => {
     onEcho && onEcho(notes);
   }
   function deafen(sec) { deafUntil = performance.now() + sec * 1000; take = []; }
-  return { start, stop, frame, deafen, st, set onEcho(fn) { onEcho = fn; }, get on() { return on; }, available: () => !ENV.framed && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) };
+  return { start, stop, wake, frame, deafen, st, set onEcho(fn) { onEcho = fn; }, set onLost(fn) { onLost = fn; }, get on() { return on; }, get busy() { return on || starting; }, available: () => !ENV.framed && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) };
 })();
 
 /* ---------- Keep the screen awake (nightlight, camera hunts) ---------- */

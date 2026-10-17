@@ -45,8 +45,9 @@ const Sound = (() => {
   }
   function unlock() {
     armed = true;
+    Mic.wake();
     if (!S.s.sound) return;
-    if (!Mic.on && !Lullaby.playing) setSession('ambient');
+    if (!Mic.busy && !Lullaby.playing) setSession('ambient');
     const g = live(); if (!g) return;
     try { const b = g.ctx.createBuffer(1, 1, 22050); const s = g.ctx.createBufferSource(); s.buffer = b; s.connect(g.ctx.destination); s.start(0); } catch (e) {}
   }
@@ -138,6 +139,7 @@ const Sound = (() => {
       sched.push([t + off, t + dur + off]);
       t += dur + rand(0.025, 0.05) * slow;
     }
+    if (g) hush(t - t0 + 0.3);
     return sched;
   }
 
@@ -170,7 +172,11 @@ const Sound = (() => {
     shutter(g, t) { hiss(g, { t, d: 0.05, peak: 0.12, type: 'highpass', f0: 2500 }); },
     snore(g, t) { hiss(g, { t, d: 1.2, peak: 0.2, type: 'bandpass', f0: 380, f1: 520, q: 1 }); hiss(g, { t: t + 1.5, d: 1.4, peak: 0.14, type: 'lowpass', f0: 420, f1: 300 }); },
   };
-  function play(name, ...args) { const g = live(); if (!g || !SFX[name]) return; try { SFX[name](g, g.ctx.currentTime + 0.01, ...args); } catch (e) {} }
+  // when Smudge's own sounds will have finished (the raw microphone hears the speaker)
+  let quietAt = 0;
+  const hush = (sec) => { quietAt = Math.max(quietAt, performance.now() + sec * 1000); };
+  const LONG = { yawn: 1.5, raspberry: 1, fanfare: 1.6, chime: 1.2, snore: 3, boing: 0.5, dizzy: 0.6 };
+  function play(name, ...args) { const g = live(); if (!g || !SFX[name]) return; hush((LONG[name] || 0.35) + 0.15); try { SFX[name](g, g.ctx.currentTime + 0.01, ...args); } catch (e) {} }
   function ping(k) { const g = live(); if (!g) return; tone(g, { f0: 880 + k * 1000, t: g.ctx.currentTime + 0.01, d: 0.06, peak: 0.04 + 0.06 * k, send: 0.35 }); }
 
   /* ---------- continuous voices: purring, inflating ---------- */
@@ -221,13 +227,14 @@ const Sound = (() => {
     e.gain.setTargetAtTime(0.0001, t, 0.05);
     o.start(t0); s.start(t0); o.stop(t + 0.4); s.stop(t + 0.4);
     vib(g, o, 5.5, 6, t0, t - t0 + 0.2);
+    hush(t - t0 + 0.5);
     return t - t0;
   }
 
   function setPitchFrom(c) { voicePitch = c ? lerp(0.86, 1.14, clamp((c.lab[0] - 0.35) / 0.55, 0, 1)) : 1; }
   function toggle(on) { S.s.sound = on; Store.save(); if (!on) { Object.values(loops).forEach((l) => l.stop()); if (G) G.ctx.suspend().catch(() => {}); } else unlock(); }
 
-  return { unlock, play, speak, ping, loop, echo, setSession, setPitchFrom, toggle, build, tone, bell, hiss, env, syll, SFX, get ctx() { return G && G.ctx; }, get graph() { return live(); } };
+  return { unlock, play, speak, ping, loop, echo, setSession, setPitchFrom, toggle, build, tone, bell, hiss, env, syll, SFX, get ctx() { return G && G.ctx; }, get graph() { return live(); }, get busy() { return performance.now() < quietAt || !!loops.purr; } };
 })();
 
 /* ============================================================

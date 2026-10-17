@@ -15,10 +15,10 @@ const App = (() => {
   let lastTouch = nowS(), nextLook = 0, nextHop = nowS() + 12, nextMuse = nowS() + 45, nextYawn = nowS() + 20, nextZ = 0, nextNote = 0, nextSave = 0, nextHud = 0, nextDay = 0;
   let pokes = [], gesture = null, expectLanding = false;
   let dizzyUntil = 0, puddleOn = false, flatSince = 0, faceDownSince = 0;
-  let inflate = 0, inflateState = 'idle', thrust = 0, floatSaid = false;
+  let inflate = 0, inflateState = 'idle', thrust = 0, floatSaid = false, nextPerk = 0;
   let lastSample = 0, lastPing = 0, lastName = '', lastNameAt = 0, ringMoved = true;
   let today = dayKey();
-  let installEvt = null, askYes = null, lastAte = 0, introUntil = 0, frameOdd = false;
+  let installEvt = null, askYes = null, lastAte = 0, introUntil = 0, frameOdd = false, updateReady = false, shownAt = performance.now();
   const HALF = 36 * 3600e3;
 
   /* ---------- canvas + layout ---------- */
@@ -386,9 +386,13 @@ const App = (() => {
     if (!Mic.available()) { UI.pressed('listen', false); UI.toast(ENV.framed ? 'Listening works once Smudge is on your Home Screen' : 'This browser can’t share the microphone'); return; }
     if (mode === 'sleep') wakeUp(true);
     const r = await Mic.start();
-    if (r === 'granted') { UI.pressed('listen', true); Pet.setFace('wide', 'o', 1); UI.say(pick(['i’m listening! hum me a tune', 'ears on. hum, or blow on me!'])); }
-    else { UI.pressed('listen', false); UI.toast(r === 'denied' ? 'Microphone access is off. You can allow it in Settings.' : 'The microphone isn’t available right now'); }
+    if (r === 'granted') {
+      UI.pressed('listen', true); Pet.setFace('wide', 'o', 1);
+      UI.say(Mic.st.needsTap ? 'tap me once so i can hear you' : pick(['i’m listening! hum me a tune', 'ears on. hum, or blow on me!']));
+    }
+    else { UI.pressed('listen', false); UI.toast(r === 'denied' ? 'Microphone access is off for Smudge. Allow it when asked, or in Settings.' : 'The microphone isn’t available right now'); }
   }
+  Mic.onLost = () => { UI.pressed('listen', false); endInflate(); UI.toast('Listening stopped. Tap Listen to start again.'); };
   Mic.onEcho = (notes) => {
     const total = notes.reduce((a, n) => a + n.d, 0);
     Mic.deafen(total + 2);
@@ -499,6 +503,9 @@ const App = (() => {
         if (inflate > 0.5) { inflateState = 'release'; thrust = rand(TAU); Sound.play('raspberry'); Pet.setFace('squint', 'o', 1.2); }
         else { inflateState = 'deflating'; Pet.setFace('happy', 'smile', 0.8); }
       }
+      if (ms.level > 0.22 && !ms.singing && ms.blow < 0.2 && inflateState === 'idle' && t > nextPerk && mode === 'home') {
+        nextPerk = t + rand(2.5, 4); Pet.setFace('wide', 'o', 0.7); Pet.lookDir(0, 1); Pet.hop(90);
+      }
       if (ms.singing && inflateState === 'idle') {
         Pet.face.openT = 0.25 + ms.level * 0.6;
         Pet.setFace('closed', 'smile', 0.4);
@@ -535,7 +542,7 @@ const App = (() => {
         if (Math.random() < 0.3) { Sound.play('yawn'); Pet.setFace('closed', 'wide', 1.3); }
         else Pet.setFace('closed', 'tiny', rand(1.8, 3.2)); // nodding off
       }
-      if (t > nextMuse && t - lastTouch > 25 && t > introUntil && !UI.speaking() && !UI.sheetOpen) { nextMuse = t + rand(45, 90); UI.say(muse()); }
+      if (t > nextMuse && t - lastTouch > 25 && t > introUntil && !UI.speaking() && !UI.sheetOpen && !Mic.on) { nextMuse = t + rand(45, 90); UI.say(muse()); }
     }
     if (mode === 'sleep' && t > nextZ) { nextZ = t + 2.4; const h = Pet.headTop(); FX.zzz(h.x + Pet.R * 0.35, h.y); }
     if (mode !== 'camera') restoreBase();
@@ -619,7 +626,19 @@ const App = (() => {
   }
   function plumbing() {
     if ('serviceWorker' in navigator && !ENV.framed && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
-      navigator.serviceWorker.register('sw.js').catch(() => {});
+      const hadController = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (!hadController) return; // first install: this copy is already current
+        // a new version just took over; pick it up now if Smudge only just came on screen, otherwise on the next return
+        if (performance.now() - shownAt < 20000 && mode === 'home' && !UI.sheetOpen && !gesture) location.reload();
+        else updateReady = true;
+      });
+      navigator.serviceWorker.register('sw.js').then((reg) => {
+        // Home Screen apps mostly resume rather than reload, so ask for a newer version on every return
+        const check = () => reg.update().catch(() => {});
+        setTimeout(check, 1500);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) check(); });
+      }).catch(() => {});
     }
     if (ENV.standalone && navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
     launchScreen();
@@ -639,7 +658,8 @@ const App = (() => {
       if (Mic.on) { Mic.stop(); UI.pressed('listen', false); endInflate(); }
       const l = Sound.loop('purr'); l && l.stop();
     } else {
-      lastT = performance.now();
+      if (updateReady && mode !== 'sleep') { location.reload(); return; }
+      shownAt = lastT = performance.now();
       updateSky(true); checkDay(); refreshPigments();
       const away = (Date.now() - (S.lastSeen || Date.now())) / 1000;
       if (away > 3600 && mode === 'home') greet(false);
